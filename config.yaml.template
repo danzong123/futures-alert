@@ -1,0 +1,45 @@
+# ============================================================
+# Futures Alert System - Configuration Template
+# ============================================================
+# Copy to config.yaml and fill in your token.
+# For GitHub Actions: set PUSHPLUS_TOKEN as a repository secret.
+# All other values are production-ready and LOCKED.
+
+wechat:
+  provider: pushplus
+  pushplus_token: "PUSHPLUS_TOKEN_PLACEHOLDER"
+  wecom_webhook: ""
+
+monitor:
+  check_interval_minutes: 5
+  trading_only: true
+  contracts: main
+  kline_period: "5"
+  kline_tail: 100
+
+# Core data table settings
+data_table:
+  range_period: 60
+  core_indicators: ["rsi", "macd_bar"]
+
+# Signal detection (tuned for 80% accuracy target)
+strategy:
+  breakout_tolerance: 0.002
+  cooldown_minutes: 30
+  min_alert_score: 40
+
+# Trade suggestion parameters
+trade_suggestions:
+  atr_stop_multiplier: 1.5
+  atr_target_1_multiplier: 1.5
+  atr_target_2_multiplier: 3.0
+
+# Push notification settings
+notify:
+  include_indicators: true
+  include_global_context: true
+  max_alerts_per_batch: 5
+  single_send: true
+  retry_count: 1
+  max_pushes_per_minute: 10
+  push_log_level: minimal
