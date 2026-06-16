@@ -89,8 +89,8 @@ alerts = get_alert_history(hours=24)
 # ---- Header Row ----
 col1, col2, col3, col4, col5 = st.columns(5)
 
-bull_count = len(signals[signals["signal"] == "bull"]) if not signals.empty else 0
-bear_count = len(signals[signals["signal"] == "bear"]) if not signals.empty else 0
+bull_count = len(signals[signals["signal"].isin(["bull", "long"])]) if not signals.empty else 0
+bear_count = len(signals[signals["signal"].isin(["bear", "short"])]) if not signals.empty else 0
 contract_count = len(snapshots) if not snapshots.empty else 0
 open_trades = perf.get("open_trades", 0)
 total_pnl = perf.get("total_pnl", 0)
@@ -98,9 +98,9 @@ total_pnl = perf.get("total_pnl", 0)
 with col1:
     st.metric("Contracts", contract_count)
 with col2:
-    st.metric("\U0001f7e2 Bull Signals", bull_count)
+    st.metric("\U0001f7e2 LONG Signals", bull_count)
 with col3:
-    st.metric("\U0001f534 Bear Signals", bear_count)
+    st.metric("\U0001f534 SHORT Signals", bear_count)
 with col4:
     st.metric("Open Trades", open_trades)
 with col5:
@@ -186,7 +186,7 @@ with tab2:
         # Summary chart
         if not signals.empty:
             sig_summary = signals.groupby("signal").size().reset_index(name="count")
-            colors_map = {"bull": "#00e676", "bear": "#ff1744"}
+            colors_map = {"bull": "#00e676", "long": "#00e676", "bear": "#ff1744", "short": "#ff1744"}
             colors_list = [colors_map.get(s, "#888") for s in sig_summary["signal"]]
 
             col_s1, col_s2 = st.columns([1, 2])
@@ -209,7 +209,7 @@ with tab2:
                 st.subheader("Recent Signals")
                 disp_sig = signals[["timestamp", "symbol", "name", "signal", "score", "price"]].head(20).copy()
                 disp_sig["signal"] = disp_sig["signal"].apply(
-                    lambda s: f"\U0001f7e2 {s.upper()}" if s == "bull" else f"\U0001f534 {s.upper()}"
+                    lambda s: f"\U0001f7e2 {s.upper()}" if s in ("bull", "long") else f"\U0001f534 {s.upper()}"
                 )
                 disp_sig.columns = ["Time", "Symbol", "Name", "Signal", "Score", "Price"]
                 st.dataframe(disp_sig, use_container_width=True, height=400, hide_index=True)
@@ -321,7 +321,7 @@ with tab4:
             with col_sa1:
                 st.markdown("**Accuracy by Signal Type**")
                 fig = go.Figure()
-                colors_sig = {"bull": "#00e676", "bear": "#ff1744"}
+                colors_sig = {"bull": "#00e676", "bear": "#ff1744", "long": "#00e676", "short": "#ff1744"}
                 for _, row in by_sig.iterrows():
                     sig = row["signal"]
                     fig.add_trace(go.Bar(
@@ -434,7 +434,7 @@ with tab5:
             with col_s1:
                 st.markdown("**Accuracy by Signal Type**")
                 fig = go.Figure()
-                colors_sig = {"bull": "#00e676", "bear": "#ff1744"}
+                colors_sig = {"bull": "#00e676", "bear": "#ff1744", "long": "#00e676", "short": "#ff1744"}
                 for _, row in by_sig.iterrows():
                     sig = row["signal"]
                     fig.add_trace(go.Bar(
@@ -518,127 +518,6 @@ with tab5:
 
         st.caption(f"Report date: {v_summary.get('date', 'N/A')} | Run `python main.py --verify` to refresh")
 
-# ---- Footer ----
-
-# ---- Tab 5: Daily Report (verification) ----
-with tab5:
-    st.subheader("📅 Daily Verification Report")
-
-    v_summary = get_verification_summary()
-    v_detail = get_verification_daily()
-
-    if not v_summary:
-        st.info("No verification data yet. Run `python main.py --verify` to generate today's report.")
-    else:
-        # ---- Summary Row ----
-        col_r1, col_r2, col_r3, col_r4, col_r5 = st.columns(5)
-        with col_r1:
-            st.metric("Signals Verified", v_summary["total"])
-        with col_r2:
-            st.metric("Accuracy", f'{v_summary["accuracy"]}%')
-        with col_r3:
-            corr = v_summary["correct"]
-            wron = v_summary["wrong"]
-            st.metric("Correct / Wrong", f"{corr} / {wron}")
-        with col_r4:
-            st.metric("Flat (no move)", v_summary["flat"])
-        with col_r5:
-            profit = v_summary["total_profit"]
-            color = "normal" if profit >= 0 else "inverse"
-            st.metric("Total P&L (1 lot)", f"{profit:+,.0f} CNY", delta_color=color)
-
-        st.divider()
-
-        # ---- By Signal Type ----
-        by_sig = v_summary.get("by_signal")
-        if by_sig is not None and not by_sig.empty:
-            col_s1, col_s2 = st.columns(2)
-            with col_s1:
-                st.markdown("**Accuracy by Signal Type**")
-                fig = go.Figure()
-                colors_sig = {"bull": "#00e676", "bear": "#ff1744"}
-                for _, row in by_sig.iterrows():
-                    sig = row["signal"]
-                    fig.add_trace(go.Bar(
-                        name=sig.upper(), x=[sig.upper()], y=[row["accuracy"]],
-                        marker_color=colors_sig.get(sig, "#888"),
-                        text=f'{row["accuracy"]}%', textposition="outside",
-                    ))
-                fig.update_layout(
-                    yaxis=dict(title="Accuracy %", range=[0, 100]),
-                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                    font_color="#ccc", height=350, showlegend=False,
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            with col_s2:
-                st.markdown("**P&L by Signal Type (1 lot)**")
-                fig2 = go.Figure()
-                for _, row in by_sig.iterrows():
-                    sig = row["signal"]
-                    fig2.add_trace(go.Bar(
-                        name=sig.upper(), x=[sig.upper()], y=[row["profit"]],
-                        marker_color=colors_sig.get(sig, "#888"),
-                        text=f'{row["profit"]:+,.0f}', textposition="outside",
-                    ))
-                fig2.update_layout(
-                    yaxis=dict(title="P&L (CNY)"),
-                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                    font_color="#ccc", height=350, showlegend=False,
-                )
-                st.plotly_chart(fig2, use_container_width=True)
-
-        # ---- By Score Range ----
-        by_score = v_summary.get("by_score")
-        if by_score is not None and not by_score.empty:
-            st.divider()
-            st.markdown("**Accuracy by Score Range**")
-            fig3 = go.Figure()
-            fig3.add_trace(go.Bar(
-                x=by_score["score_range"], y=by_score["accuracy"],
-                marker=dict(
-                    color=by_score["accuracy"].apply(
-                        lambda v: "#00e676" if v >= 60 else ("#ffab40" if v >= 40 else "#ff1744")
-                    ),
-                ),
-                text=by_score["accuracy"].apply(lambda v: f"{v:.0f}%"),
-                textposition="outside",
-            ))
-            fig3.update_layout(
-                xaxis=dict(title="Score Range"),
-                yaxis=dict(title="Accuracy %", range=[0, 105]),
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                font_color="#ccc", height=300,
-            )
-            st.plotly_chart(fig3, use_container_width=True)
-
-        # ---- Detail Table ----
-        st.divider()
-        st.markdown("**Signal Verification Detail**")
-        if not v_detail.empty:
-            disp = v_detail[[
-                "symbol", "name", "signal", "score", "signal_price", "verify_price",
-                "change_pct", "profit_per_lot", "contract_mult"
-            ]].copy()
-            disp["signal"] = disp["signal"].str.upper()
-
-            def status_row(row):
-                if row["is_flat"] == 1:
-                    return "∼ FLAT"
-                elif row["is_correct"] == 1:
-                    return "✓ CORRECT"
-                return "✗ WRONG"
-            disp["Status"] = v_detail.apply(status_row, axis=1)
-
-            disp["change_pct"] = disp["change_pct"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "0")
-            disp["profit_per_lot"] = disp["profit_per_lot"].apply(lambda x: f"{x:+,.0f}" if pd.notna(x) else "0")
-            disp.columns = [
-                "Symbol", "Name", "Signal", "Score", "Signal Price", "Verify Price",
-                "Change %", "P&L/lot", "Mult", "Status"
-            ]
-            st.dataframe(disp, use_container_width=True, height=500, hide_index=True)
-
-        st.caption(f"Report date: {v_summary.get('date', 'N/A')} | Run `python main.py --verify` to refresh")
 
 # ---- Footer ----
 

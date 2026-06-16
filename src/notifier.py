@@ -131,6 +131,8 @@ class PushDispatcher:
         self._cond = threading.Condition(self._lock)
         self._worker_thread: Optional[threading.Thread] = None
         self._running = False
+        self._sending = False  # Hard lock: at most 1 push in flight at any time
+
 
     def start(self):
         """Launch the background push worker thread."""
@@ -180,10 +182,14 @@ class PushDispatcher:
             if wait > 0:
                 time.sleep(wait)
 
-            # Send single push with retry
+            # Hard single-send enforcement: only 1 push in flight at any time
+            # Batch sending is PROHIBITED. Each push completes before the next begins.
+            self._sending = True
+            # Send single push with retry (retry_count=1 means at most 2 total attempts)
             ok = self._notifier.send_single(title, content, self._retry_count)
 
             # Minimal logging: only success/failure per push
+            self._sending = False
             if ok:
                 logger.info(f"Push OK: {title}")
             else:

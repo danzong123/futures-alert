@@ -2,15 +2,15 @@ name: Futures Alert Monitor
 
 on:
   schedule:
-    # Day session: CST 9:00-15:00 = UTC 1:00-7:00 Mon-Fri
-    # Night session: CST 21:00-2:30 = UTC 13:00-18:30 Mon-Fri
+    # Day session: CST 9:00-15:00 => UTC 1:00-7:00, every 5 min, Mon-Fri
+    # Night session: CST 21:00-02:30 => UTC 13:00-18:30, every 5 min, Mon-Fri
     - cron: '*/5 1-6,13-18 * * 1-5'
   workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     env:
       TZ: Asia/Shanghai
@@ -24,16 +24,17 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Create config from secrets
+      - name: Create config from template
         run: |
           sed "s/PUSHPLUS_TOKEN_PLACEHOLDER/${{ secrets.PUSHPLUS_TOKEN }}/g" config.yaml.template > config.yaml
 
       - name: Ensure outputs directory
         run: mkdir -p outputs
 
-      - name: Run signal check
+      - name: Run signal check (single scan)
         run: python main.py --now

@@ -7,6 +7,7 @@ Core flow: fetch quotes -> load K-lines -> build snapshots -> detect signals -> 
   - All parameters locked in config.yaml; no auto-modification at runtime.
 """
 import os, sys, time, yaml, logging, argparse
+import pandas as pd
 from datetime import datetime, time as dt_time
 
 # Strip broken proxy settings that would block all outbound HTTP requests
@@ -15,7 +16,7 @@ for _key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROX
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.data_fetcher import get_main_contract_quotes, get_minute_candles
+from src.data_fetcher import get_main_contract_quotes, get_minute_candles, get_daily_candles
 from src.indicators import calc_all_indicators
 from src.strategy import analyze_contracts_simple
 from src.notifier import WeChatNotifier, PushDispatcher
@@ -38,8 +39,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
-CACHE = {}          # symbol -> DataFrame (K-line + indicators)
-ANTI_SPAM = {}      # symbol -> last_alert_timestamp (epoch seconds)
+CACHE = {}          # symbol -> DataFrame (15-min K-line + indicators)
+SWING_CACHE = {}    # symbol -> {high, low, last_date}  daily swing range, fixed intraday
+ANTI_SPAM = {}      # symbol:signal_type -> last_alert_timestamp (epoch seconds, band reversal per-direction cooldown)
+DAILY_STATS = {"date": "", "pushed": 0}  # daily trade counter for swing trading limit
+_LAST_SWING_UPDATE_DAY = ""  # Track which date we last fully updated swing ranges (once per day, post-close only)
 
 
 def load_config():
@@ -97,6 +101,133 @@ def load_all_klines(symbols: list, period: str, tail: int):
 # Contract snapshot builder
 # ================================================================
 
+# ================================================================
+# Swing range: daily K-line based, fixed intraday
+# ================================================================
+
+def update_swing_ranges(all_symbols: list, config: dict):
+    """Load daily K-lines and update SWING_CACHE with swing high/low,
+    daily-based indicators (Bollinger, ATR, RSI, MACD, MA), volume ratio,
+    and OI change. Only refreshes when a new daily bar closes.
+    Returns (updated_count, total_count)."""
+    global _LAST_SWING_UPDATE_DAY
+    today_str = datetime.now().strftime("%Y%m%d")
+
+    # --- Time gate: only recalculate daily bands once per day, post-close ---
+    # During trading hours (9:00-15:00), SWING_CACHE is read-only.
+    # Full recalculation happens once after 15:00 close to reduce backend load.
+    now = datetime.now()
+    post_close = now.hour >= 15
+    already_updated_today = (_LAST_SWING_UPDATE_DAY == today_str)
+
+    # Cold start: populate cache on first run regardless of time
+    if not SWING_CACHE:
+        logger.info("Swing cache cold start - initializing daily band data")
+    elif already_updated_today:
+        logger.debug("Swing ranges: already updated for %s (read-only intraday)", today_str)
+        return 0, len(all_symbols)
+    elif not post_close:
+        if SWING_CACHE:
+            logger.debug("Swing ranges: trading hours read-only, %d cached", len(SWING_CACHE))
+        return 0, len(all_symbols)
+
+    # --- Post-close first update today: recalculate all daily bands ---
+    logger.info("Swing ranges: post-close recalculation for %s (%d symbols)", today_str, len(all_symbols))
+
+    data_cfg = config.get("data_table", {})
+    daily_bars = int(data_cfg.get("swing_daily_bars", 20))
+    updated = 0
+
+    for sym in all_symbols:
+        try:
+            df = get_daily_candles(sym)
+            if df is None or df.empty or "high" not in df.columns or "low" not in df.columns:
+                continue
+
+            # Use enough bars for indicators (need 60+ for reliable daily MA/ATR/BOLL)
+            work_df = df.tail(max(daily_bars, 80))
+            if len(work_df) < 10:
+                continue
+
+            # Only refresh when a new daily bar closes (date changes)
+            if "date" in work_df.columns:
+                latest_bar_date = str(work_df["date"].iloc[-1].date()).replace("-", "")
+            else:
+                latest_bar_date = today_str
+            cached = SWING_CACHE.get(sym)
+            if cached and cached.get("last_date") == latest_bar_date:
+                continue
+
+            # Compute all daily indicators
+            ind_df = calc_all_indicators(work_df)
+            latest = ind_df.iloc[-1]
+            prev = ind_df.iloc[-2] if len(ind_df) >= 2 else None
+
+            # Swing high/low from last N daily bars
+            recent_n = ind_df.tail(daily_bars)
+            swing_high = float(recent_n["high"].max())
+            swing_low = float(recent_n["low"].min())
+
+            # Helper: safe float extraction from indicator row
+            def _d(col, decimals=4):
+                v = latest.get(col)
+                if v is None or (isinstance(v, float) and v != v):
+                    return None
+                return round(float(v), decimals)
+
+            # Daily volume ratio: latest / 20-day avg
+            vol_ratio = None
+            if "volume" in recent_n.columns:
+                avg_vol = float(recent_n["volume"].mean())
+                latest_vol = float(recent_n["volume"].iloc[-1])
+                if avg_vol > 0:
+                    vol_ratio = round(latest_vol / avg_vol, 1)
+
+            # Daily OI change
+            oi_change_pct = None
+            if "open_interest" in work_df.columns and len(work_df) >= 2:
+                prev_oi = float(work_df["open_interest"].iloc[-2])
+                latest_oi = float(work_df["open_interest"].iloc[-1])
+                if prev_oi > 0 and not pd.isna(prev_oi) and not pd.isna(latest_oi):
+                    oi_change_pct = round((latest_oi - prev_oi) / prev_oi * 100, 1)
+
+            # MACD bar comparison (current vs previous daily bar)
+            macd_bar = _d("macd_bar", 4)
+            macd_bar_prev = round(float(prev["macd_bar"]), 4) if prev is not None and "macd_bar" in prev and not pd.isna(prev["macd_bar"]) else None
+
+            SWING_CACHE[sym] = {
+                "high": swing_high,
+                "low": swing_low,
+                "last_date": latest_bar_date,
+                "vol_ratio": vol_ratio,
+                "oi_change_pct": oi_change_pct,
+                # Daily Bollinger (20-day, 2x std)
+                "boll_upper": _d("boll_upper", 2),
+                "boll_mid": _d("boll_mid", 2),
+                "boll_lower": _d("boll_lower", 2),
+                # Daily ATR (14-day)
+                "atr": _d("atr", 2),
+                # Daily RSI (14-day)
+                "rsi": _d("rsi", 1),
+                # Daily MACD
+                "macd_bar": macd_bar,
+                "macd_bar_prev": macd_bar_prev,
+                "macd_dif": _d("macd_dif", 4),
+                "macd_dea": _d("macd_dea", 4),
+                # Daily MA
+                "ma5": _d("ma5", 2),
+                "ma10": _d("ma10", 2),
+                "ma20": _d("ma20", 2),
+            }
+            updated += 1
+        except Exception as e:
+            logger.debug("Swing range skip %s: %s", sym, str(e)[:80])
+
+    # Mark today's update as complete (prevents re-update until next day post-close)
+    _LAST_SWING_UPDATE_DAY = today_str
+
+    return updated, len(all_symbols)
+
 def build_contract_snapshots(quotes_df, news_impacts, config):
     """Build core data records for each contract from cached K-lines."""
     data_cfg = config.get("data_table", {})
@@ -131,9 +262,16 @@ def build_contract_snapshots(quotes_df, news_impacts, config):
 
         name = str(row.get("name", symbol))
 
-        recent = candle_df.tail(range_period)
-        range_high = float(recent["high"].max()) if "high" in recent.columns else None
-        range_low = float(recent["low"].min()) if "low" in recent.columns else None
+        # Swing range: use daily K-line based SWING_CACHE (fixed intraday)
+        swing = SWING_CACHE.get(symbol)
+        if swing and swing.get("high") and swing.get("low"):
+            range_high = swing["high"]
+            range_low = swing["low"]
+        else:
+            # Fallback: compute from 15-min K-line (should rarely happen)
+            recent = candle_df.tail(range_period)
+            range_high = float(recent["high"].max()) if "high" in recent.columns else None
+            range_low = float(recent["low"].min()) if "low" in recent.columns else None
 
         # Real-time price (may be NaN outside trading hours; fall back to latest K-line close)
         rt = row.get("last_price")
@@ -142,43 +280,57 @@ def build_contract_snapshots(quotes_df, news_impacts, config):
         else:
             latest_price = float(candle_df.iloc[-1]["close"]) if "close" in candle_df.columns else None
 
-        # Core indicators from latest K-line bar
-        latest_row = candle_df.iloc[-1]
+        # Core indicators: use daily-based values from SWING_CACHE
         ind1_name, ind1_value = None, None
         ind2_name, ind2_value = None, None
-        if len(core_indicators) >= 1:
+        if len(core_indicators) >= 1 and swing:
             i1 = core_indicators[0]
-            val = latest_row.get(i1)
-            if val is not None and not (isinstance(val, float) and val != val):
-                ind1_name, ind1_value = i1, round(float(val), 2)
-        if len(core_indicators) >= 2:
+            v = swing.get(i1)
+            if v is not None:
+                ind1_name, ind1_value = i1, round(float(v), 2)
+        if len(core_indicators) >= 2 and swing:
             i2 = core_indicators[1]
-            val = latest_row.get(i2)
-            if val is not None and not (isinstance(val, float) and val != val):
-                ind2_name, ind2_value = i2, round(float(val), 2)
+            v = swing.get(i2)
+            if v is not None:
+                ind2_name, ind2_value = i2, round(float(v), 2)
 
-        # Extended indicators for trade suggestions
+        # Extended indicators (daily-based from SWING_CACHE; fallback to 15-min)
         def _safe_float(col):
-            v = latest_row.get(col)
+            row = candle_df.iloc[-1]
+            v = row.get(col)
             if v is not None and not (isinstance(v, float) and v != v):
                 return round(float(v), 4)
             return None
 
-        atr = _safe_float("atr")
-        boll_upper = _safe_float("boll_upper")
-        boll_mid = _safe_float("boll_mid")
-        boll_lower = _safe_float("boll_lower")
-        volume_ratio = _safe_float("volume_ratio")
-        position_pct = _safe_float("position_pct")
-        ma5 = _safe_float("ma5")
-        ma10 = _safe_float("ma10")
-        ma20 = _safe_float("ma20")
-        oi_change_pct = _safe_float("oi_change_pct")
+        def _swing(key, decimals=4):
+            """Get a value from SWING_CACHE, falling back to 15-min indicator."""
+            if swing and swing.get(key) is not None:
+                v = swing[key]
+                return round(float(v), decimals) if v is not None else None
+            return _safe_float(key)
 
-        # News attachment
+        atr = _swing("atr", 4)
+        boll_upper = _swing("boll_upper", 4)
+        boll_mid = _swing("boll_mid", 4)
+        boll_lower = _swing("boll_lower", 4)
+        volume_ratio = _swing("vol_ratio", 4) if swing and swing.get("vol_ratio") is not None else _safe_float("volume_ratio")
+        # Compute position_pct from swing range: (price - low) / (high - low) * 100
+        if range_high and range_low and range_high > range_low and latest_price:
+            position_pct = round((latest_price - range_low) / (range_high - range_low) * 100, 0)
+        else:
+            position_pct = _safe_float("position_pct")
+        ma5 = _swing("ma5", 4)
+        ma10 = _swing("ma10", 4)
+        ma20 = _swing("ma20", 4)
+        oi_change_pct = _swing("oi_change_pct", 4) if swing and swing.get("oi_change_pct") is not None else _safe_float("oi_change_pct")
+
+        # News attachment (all relevant headlines with impact duration)
         sym_news = news_map.get(symbol, [])
+        # Sort: medium-term (中期) first, then long (长期), then short (短期)
+        sym_news.sort(key=lambda n: {"medium": 0, "long": 1, "short": 2}.get(n.get("impact", "short"), 2))
         news_summary = sym_news[0]["headline"][:200] if sym_news else None
         news_direction = sym_news[0]["direction"] if sym_news else None
+        news_impact_label = sym_news[0].get("impact_label", "") if sym_news else ""
 
         records.append({
             "symbol": symbol,
@@ -200,8 +352,11 @@ def build_contract_snapshots(quotes_df, news_impacts, config):
             "ma10": ma10,
             "ma20": ma20,
             "oi_change_pct": oi_change_pct,
+            "macd_bar_prev": _swing("macd_bar_prev", 4) if swing and swing.get("macd_bar_prev") is not None else None,
             "news_summary": news_summary,
             "news_direction": news_direction,
+            "news_impact_label": news_impact_label,
+            "all_news": sym_news,  # all matched news for this symbol with duration
         })
 
     return records
@@ -225,6 +380,13 @@ def run_check(config, notifier):
     total_count = len(all_symbols)
     logger.info("Main contracts: %d total", total_count)
 
+    # --- Watchlist filter: only monitor configured symbols (swing trading mode) ---
+    watchlist = config.get("watchlist", [])
+    if watchlist:
+        quotes = quotes[quotes["symbol"].isin(watchlist)]
+        all_symbols = quotes["symbol"].tolist()
+        logger.info("Watchlist filter: %d/%d contracts selected", len(all_symbols), total_count)
+        total_count = len(all_symbols)
     # Load K-lines first, then filter by which ones actually have recent data
 
     # --- Step 2: Load K-lines for all contracts (per-contract error isolation) ---
@@ -269,6 +431,11 @@ def run_check(config, notifier):
     news_impacts = analyze_news_impact(headlines)
     logger.info("News impact: %d matched items", len(news_impacts))
 
+    # --- Step 3b: Update swing ranges from daily K-lines (fixed intraday) ---
+    swing_updated, swing_total = update_swing_ranges(all_symbols, config)
+    logger.info("Swing ranges: %d updated / %d total (cache: %d)",
+                swing_updated, swing_total, len(SWING_CACHE))
+
     snapshots = build_contract_snapshots(quotes, news_impacts, config)
     if snapshots:
         save_contract_snapshots_batch(snapshots)
@@ -283,15 +450,32 @@ def run_check(config, notifier):
         save_signals(signals)
         notify_cfg = config.get("notify", {})
         max_send = notify_cfg.get("max_alerts_per_batch", 5)
-        for s in signals[:max_send]:
-            save_alert(s["name"], s["message"])
-            title = "Futures %s %s" % (s["name"], s["signal"])
-            notifier.enqueue(title, s["message"])
-        enqueued = min(len(signals), max_send)
-        logger.info("Enqueued %d alert(s)", enqueued)
-        bulls = sum(1 for s in signals if s["signal"] == "bull")
-        bears = sum(1 for s in signals if s["signal"] == "bear")
-        logger.info("Summary: Bull %d | Bear %d", bulls, bears)
+        # --- Daily trade limit enforcement (swing trading: max 3/day) ---
+        trade_limits = config.get("trade_limits", {})
+        daily_max = trade_limits.get("daily_max_alerts", 3)
+        today_str = datetime.now().strftime("%Y%m%d")
+        if DAILY_STATS.get("date") != today_str:
+            DAILY_STATS["date"] = today_str
+            DAILY_STATS["pushed"] = 0
+            logger.info("Daily trade counter reset for %s", today_str)
+        remaining = daily_max - DAILY_STATS["pushed"]
+        if remaining <= 0:
+            logger.info("Daily limit reached (%d/%d) - all alerts suppressed", DAILY_STATS["pushed"], daily_max)
+            enqueued = 0
+        else:
+            batch_limit = min(max_send, remaining)
+            pushed_count = 0
+            for s in signals[:batch_limit]:
+                save_alert(s["name"], s["message"])
+                title = "Futures %s %s" % (s["name"], s["signal"])
+                notifier.enqueue(title, s["message"])
+                pushed_count += 1
+            DAILY_STATS["pushed"] += pushed_count
+            enqueued = pushed_count
+            logger.info("Enqueued %d alert(s) | Daily: %d/%d", pushed_count, DAILY_STATS["pushed"], daily_max)
+        longs = sum(1 for s in signals if s["signal"] == "long")
+        shorts = sum(1 for s in signals if s["signal"] == "short")
+        logger.info("Summary: LONG %d | SHORT %d", longs, shorts)
     else:
         logger.info("No signals - market neutral")
 
@@ -383,7 +567,7 @@ def run_verify(config):
             change_pct = round((latest_close - signal_price) / signal_price * 100, 2)
             verified += 1
 
-            if signal == "bull":
+            if signal == "long":
                 is_correct = latest_close > signal_price
             else:
                 is_correct = latest_close < signal_price
@@ -411,9 +595,14 @@ def run_verify(config):
             except Exception:
                 pass
 
+            sig_display = signal.upper()
+            if sig_display == "BULL":
+                sig_display = "LONG"
+            elif sig_display == "BEAR":
+                sig_display = "SHORT"
             report.append(
                 f"  {status:12s} | {name:10s} {symbol:6s} | "
-                f"{signal.upper():4s} | signal@{signal_price:.0f} -> "
+                f"{sig_display:4s} | signal@{signal_price:.0f} -> "
                 f"close@{latest_close:.0f} ({change_pct:+.2f}%)"
             )
 

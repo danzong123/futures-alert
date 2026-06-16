@@ -617,8 +617,8 @@ def get_signal_trade_analysis(hours: int = 168) -> pd.DataFrame:
         if not df.empty:
             def _aligned(row):
                 if pd.isna(row['trade_direction']): return None
-                return (row['signal'] == 'bull' and row['trade_direction'] == 'long') or \
-                       (row['signal'] == 'bear' and row['trade_direction'] == 'short')
+                return (row['signal'] in ('bull', 'long') and row['trade_direction'] == 'long') or \
+                       (row['signal'] in ('bear', 'short') and row['trade_direction'] == 'short')
             df['direction_aligned'] = df.apply(_aligned, axis=1)
 
             def _accurate(row):

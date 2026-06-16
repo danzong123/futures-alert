@@ -99,3 +99,41 @@ def get_futures_news() -> list:
     except Exception as e:
         logger.warning(f"Failed to get financial news: {e}")
     return []
+
+
+def get_daily_candles(symbol: str) -> pd.DataFrame:
+    """
+    Get daily K-line data for swing range, volume ratio, and OI change.
+    AKShare: futures_zh_daily_sina(symbol)
+    Returns columns: date, open, high, low, close, volume, open_interest (if available)
+    """
+    try:
+        df = ak.futures_zh_daily_sina(symbol=symbol)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # Standardize column names (hold/position -> open_interest)
+        col_map = {
+            "date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+            "hold": "open_interest",
+            "position": "open_interest",
+        }
+        rename_map = {k: v for k, v in col_map.items() if k in df.columns}
+        df.rename(columns=rename_map, inplace=True)
+        # Keep relevant columns
+        keep_cols = [c for c in ["date", "open", "high", "low", "close", "volume", "open_interest"] if c in df.columns]
+        df = df[keep_cols].copy()
+        for col in ["open", "high", "low", "close", "volume", "open_interest"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date")
+        return df
+    except Exception as e:
+        logger.warning(f"Failed to get {symbol} daily K-line: {e}")
+        return pd.DataFrame()
