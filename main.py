@@ -19,7 +19,8 @@ from src.data_fetcher import get_main_contract_quotes, get_minute_candles
 from src.indicators import calc_all_indicators
 from src.strategy import analyze_contracts_simple
 from src.notifier import WeChatNotifier, PushDispatcher
-from src.database import init_db, save_signals, save_alert, save_contract_snapshots_batch
+from src.database import (init_db, save_signals, save_alert, save_contract_snapshots_batch,
+                         save_verification_result, get_verification_summary)
 from src.global_news import collect_global_context
 from src.news_analyzer import analyze_news_impact
 
@@ -292,7 +293,7 @@ def run_verify(config):
     """Verify signal accuracy by comparing predicted direction with subsequent price movement.
     For each signal: fetch current K-line, compare signal price to latest close.
     Bull correct if close > signal_price. Bear correct if close < signal_price."""
-    from src.database import get_signal_history
+    from src.database import get_signal_history, get_connection
     import pandas as pd
 
     logger.info("=" * 50)
@@ -302,6 +303,16 @@ def run_verify(config):
     # Get config
     monitor_cfg = config.get("monitor", {})
     period = str(monitor_cfg.get("kline_period", "5"))
+
+    # Clear today's verification records before re-verifying
+    try:
+        conn = get_connection()
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn.execute("DELETE FROM verification_log WHERE verify_date = ?", (today,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
     # Load signals from today
     signals_df = get_signal_history(hours=48)
@@ -371,6 +382,18 @@ def run_verify(config):
                 wrong += 1
                 status = "✗ WRONG"
 
+            # Persist to database for daily review
+            try:
+                save_verification_result(
+                    signal_id=int(row["id"]), symbol=symbol, name=name,
+                    signal=signal, score=int(row.get("score", 0) or 0),
+                    signal_price=signal_price, verify_price=latest_close,
+                    change_pct=change_pct,
+                    is_correct=is_correct, is_flat=(abs(change_pct) < 0.005),
+                )
+            except Exception:
+                pass
+
             report.append(
                 f"  {status:12s} | {name:10s} {symbol:6s} | "
                 f"{signal.upper():4s} | signal@{signal_price:.0f} -> "
@@ -402,6 +425,23 @@ def run_verify(config):
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(report))
     logger.info("Report saved to outputs/verify_report.txt")
+
+    # Print daily summary
+    summary = get_verification_summary()
+    if summary:
+        logger.info("")
+        logger.info("=== DAILY SUMMARY ===")
+        logger.info("  Date: %s", summary.get("date"))
+        logger.info("  Total verified: %d | Correct: %d | Wrong: %d | Flat: %d",
+                    summary["total"], summary["correct"], summary["wrong"], summary["flat"])
+        logger.info("  Accuracy: %s%% | Total P&L (1 lot): %+.0f CNY",
+                    summary["accuracy"], summary["total_profit"])
+        by_sig = summary.get("by_signal")
+        if by_sig is not None and not by_sig.empty:
+            for _, row in by_sig.iterrows():
+                logger.info("  %s: accuracy %s%% | P&L %+.0f",
+                           row["signal"].upper(), row["accuracy"], row["profit"])
+        logger.info("======================")
 
 def main():
     parser = argparse.ArgumentParser(description="Futures Alert Monitor")

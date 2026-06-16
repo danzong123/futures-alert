@@ -17,6 +17,26 @@ DB_DIR = os.path.join(os.environ.get(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "outputs")
 ))
 os.makedirs(DB_DIR, exist_ok=True)
+
+# Contract multipliers (CNY per point for 1 lot)
+CONTRACT_MULTIPLIERS = {
+    "RB": 10, "HC": 10, "I": 100, "J": 100, "JM": 60, "SS": 5,
+    "CU": 5, "AL": 5, "ZN": 5, "PB": 5, "NI": 1, "SN": 1, "AO": 20,
+    "AU": 1000, "AG": 15,
+    "SC": 1000, "FU": 10, "LU": 10, "BU": 10, "NR": 10, "RU": 10,
+    "MA": 10, "TA": 5, "EG": 10, "PF": 5, "PR": 5, "PX": 5,
+    "PL": 5, "PP": 5, "L": 5, "V": 5, "EB": 5,
+    "SA": 20, "SH": 20, "UR": 20, "FG": 20,
+    "M": 10, "Y": 10, "P": 10, "OI": 10, "RM": 10,
+    "C": 10, "CS": 10, "A": 10, "B": 10, "CF": 5, "SR": 10,
+    "AP": 10, "CJ": 5, "JD": 10, "LH": 16, "PG": 20,
+    "SI": 5, "LC": 1, "EC": 50,
+    "IF": 300, "IC": 200, "IH": 300, "IM": 200,
+    "BC": 5, "PK": 5, "CY": 5, "JR": 20, "RI": 20, "LR": 20,
+    "WH": 20, "SM": 5, "SF": 5, "RS": 10, "SP": 10,
+    "WR": 10, "AD": 5, "PD": 10,
+}
+
 DB_PATH = os.path.join(DB_DIR, "futures_alert.db")
 
 
@@ -109,6 +129,33 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
             CREATE INDEX IF NOT EXISTS idx_mcd_symbol ON main_contract_data(symbol);
             CREATE INDEX IF NOT EXISTS idx_mcd_timestamp ON main_contract_data(timestamp);
+
+            -- Daily verification log: track signal accuracy vs actual price movement
+            CREATE TABLE IF NOT EXISTS verification_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER NOT NULL,
+                verify_date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                score INTEGER,
+                signal_price REAL NOT NULL,
+                verify_price REAL NOT NULL,
+                change_pct REAL NOT NULL,
+                is_correct INTEGER NOT NULL DEFAULT 0,
+                is_flat INTEGER NOT NULL DEFAULT 0,
+                contract_mult REAL DEFAULT 10,
+                profit_per_lot REAL DEFAULT 0,
+                entry_price REAL,
+                stop_loss REAL,
+                target_1 REAL,
+                target_2 REAL,
+                created_at TEXT DEFAULT (datetime('now','localtime')),
+                FOREIGN KEY (signal_id) REFERENCES signal_log(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_verify_date ON verification_log(verify_date);
+            CREATE INDEX IF NOT EXISTS idx_verify_signal ON verification_log(signal);
         """)
         conn.commit()
         logger.info("Database initialized")
@@ -644,4 +691,128 @@ def get_signal_accuracy_summary(hours: int = 168) -> dict:
             if (accurate + inaccurate) > 0 else 0,
         'by_signal': by_signal,
         'by_score': score_buckets,
+    }
+
+
+def save_verification_result(
+    signal_id: int, symbol: str, name: str, signal: str, score: int,
+    signal_price: float, verify_price: float, change_pct: float,
+    is_correct: bool, is_flat: bool,
+    entry_price: float = None, stop_loss: float = None,
+    target_1: float = None, target_2: float = None,
+):
+    """Save a single signal verification result."""
+    conn = get_connection()
+    now = datetime.now().strftime("%Y-%m-%d")
+
+    # Get contract multiplier (strip trailing numbers from symbol like RB0 -> RB)
+    base = symbol.rstrip("0123456789")
+    mult = CONTRACT_MULTIPLIERS.get(base, 10)
+
+    # Calculate profit per lot
+    if is_flat:
+        profit = 0
+    elif is_correct:
+        profit = abs(verify_price - signal_price) * mult
+    else:
+        profit = -abs(verify_price - signal_price) * mult
+
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO verification_log
+               (signal_id, verify_date, symbol, name, signal, score,
+                signal_price, verify_price, change_pct, is_correct, is_flat,
+                contract_mult, profit_per_lot, entry_price, stop_loss, target_1, target_2)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (signal_id, now, symbol, name, signal, score,
+             signal_price, verify_price, change_pct,
+             1 if is_correct else 0, 1 if is_flat else 0,
+             mult, round(profit, 2),
+             entry_price, stop_loss, target_1, target_2),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Save verification failed for {symbol}: {e}")
+    finally:
+        conn.close()
+
+
+def get_verification_daily(date: str = None) -> pd.DataFrame:
+    """Get verification results for a specific date (default: today)."""
+    conn = get_connection()
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    try:
+        df = pd.read_sql_query(
+            """SELECT * FROM verification_log
+               WHERE verify_date = ?
+               ORDER BY signal_id DESC""",
+            conn, params=(date,),
+        )
+        return df
+    except Exception as e:
+        logger.error(f"Verification query failed: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
+def get_verification_summary(date: str = None) -> dict:
+    """Summary stats for daily verification."""
+    df = get_verification_daily(date)
+    if df.empty:
+        return {}
+
+    total = len(df)
+    correct = int((df['is_correct'] == 1).sum())
+    wrong = int(((df['is_correct'] == 0) & (df['is_flat'] == 0)).sum())
+    flat = int((df['is_flat'] == 1).sum())
+    meaningful = correct + wrong
+
+    total_profit = float(df['profit_per_lot'].sum())
+    avg_profit = float(df[df['is_flat'] == 0]['profit_per_lot'].mean()) if meaningful > 0 else 0
+
+    # By signal type
+    by_sig = df.groupby('signal').agg(
+        total=('id', 'count'),
+        correct=('is_correct', 'sum'),
+        wrong=('is_correct', lambda x: ((x == 0) & (df.loc[x.index, 'is_flat'] == 0)).sum()),
+        flat=('is_flat', 'sum'),
+        profit=('profit_per_lot', 'sum'),
+    ).reset_index()
+
+    if not by_sig.empty:
+        by_sig['accuracy'] = by_sig.apply(
+            lambda r: round(r['correct'] / (r['correct'] + r['wrong']) * 100, 1)
+            if (r['correct'] + r['wrong']) > 0 else 0, axis=1
+        )
+
+    # Accuracy by score range (excl flat)
+    non_flat = df[df['is_flat'] == 0].copy()
+    by_score = pd.DataFrame()
+    if not non_flat.empty:
+        bins = [0, 30, 40, 50, 60, 100]
+        labels = ['0-30', '30-40', '40-50', '50-60', '60+']
+        non_flat['score_range'] = pd.cut(non_flat['score'], bins=bins, labels=labels, right=False)
+        by_score = non_flat.groupby('score_range', observed=False).agg(
+            total=('id', 'count'),
+            correct=('is_correct', 'sum'),
+            profit=('profit_per_lot', 'sum'),
+        ).reset_index()
+        by_score['accuracy'] = by_score.apply(
+            lambda r: round(r['correct'] / r['total'] * 100, 1) if r['total'] > 0 else 0, axis=1
+        )
+
+    return {
+        'date': date or datetime.now().strftime("%Y-%m-%d"),
+        'total': total,
+        'correct': correct,
+        'wrong': wrong,
+        'flat': flat,
+        'meaningful': meaningful,
+        'accuracy': round(correct / meaningful * 100, 1) if meaningful > 0 else 0,
+        'total_profit': round(total_profit, 2),
+        'avg_profit': round(avg_profit, 2),
+        'by_signal': by_sig,
+        'by_score': by_score,
     }
