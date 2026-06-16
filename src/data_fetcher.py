@@ -59,30 +59,16 @@ def get_realtime_quotes() -> pd.DataFrame:
 
 def get_main_contract_quotes() -> pd.DataFrame:
     """
-    Get realtime quotes for all main contracts.
-    First gets main contract list via display_main_sina,
-    then matches realtime prices via zh_realtime.
-    Outside trading hours, falls back to latest K-line close.
-    Only main contracts are fetched - sub/forward contracts excluded.
+    Get main contract list with basic info.
+    Price data is filled later from K-line data (more reliable than realtime API).
     """
     main_list = get_main_contract_list()
     if main_list.empty:
         return pd.DataFrame()
 
-    realtime = get_realtime_quotes()
+    logger.info(f"Main contracts: {len(main_list)} total (price from K-line)")
 
-    # Left join: main contract list + realtime quotes
-    merged = main_list.merge(
-        realtime[["symbol", "last_price", "change_pct", "volume",
-                   "open_interest", "high", "low", "open", "pre_close",
-                   "bidprice1", "askprice1"]],
-        on="symbol", how="left"
-    )
-
-    has_quote = merged["last_price"].notna().sum()
-    logger.info(f"Main contracts: {len(merged)} total ({has_quote} with realtime quotes)")
-
-    return merged
+    return main_list
 
 
 def get_minute_candles(symbol: str, period: str = "5") -> pd.DataFrame:

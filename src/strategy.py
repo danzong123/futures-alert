@@ -484,30 +484,31 @@ def analyze_contracts_simple(
 
         # --- Step 2b: Volume gate (breakouts without volume = fake) ---
         vol_ratio = _safe(snap.get("volume_ratio"))
-        if vol_ratio is None or vol_ratio < 1.0:
+        if vol_ratio is None or vol_ratio < 0.3:
             logger.debug("%s: rejected - volume_ratio=%.2f below 1.0", symbol, vol_ratio or 0)
             continue
 
-        # --- Step 2c: MA short-term alignment gate ---
+        # --- Step 2c: MA short-term alignment gate (TEMPORARILY DISABLED for tuning) ---
         ma5 = _safe(snap.get("ma5"))
         ma10 = _safe(snap.get("ma10"))
-        if ma5 is not None and ma10 is not None:
-            if direction == "up" and ma5 <= ma10:
-                logger.debug("%s: rejected - MA5(%.2f) <= MA10(%.2f) on bullish", symbol, ma5, ma10)
-                continue
-            if direction == "down" and ma5 >= ma10:
-                logger.debug("%s: rejected - MA5(%.2f) >= MA10(%.2f) on bearish", symbol, ma5, ma10)
-                continue
+        if False:  # disabled during gate tuning
+            if ma5 is not None and ma10 is not None:
+                if direction == "up" and ma5 <= ma10:
+                    logger.debug("%s: rejected - MA5(%.2f) <= MA10(%.2f) on bullish", symbol, ma5, ma10)
+                    continue
+                if direction == "down" and ma5 >= ma10:
+                    logger.debug("%s: rejected - MA5(%.2f) >= MA10(%.2f) on bearish", symbol, ma5, ma10)
+                    continue
 
         # --- Step 2d: Minimum breakout penetration (0.1% beyond boundary) ---
         if direction == "up" and range_high and range_high > 0:
             penetration = (latest_price - range_high) / range_high
-            if penetration < 0.001:
+            if False:  # penetration gate disabled
                 logger.debug("%s: rejected - penetration %.4f below 0.1%%", symbol, penetration)
                 continue
         elif direction == "down" and range_low and range_low > 0:
             penetration = (range_low - latest_price) / range_low
-            if penetration < 0.001:
+            if False:  # penetration gate disabled
                 logger.debug("%s: rejected - penetration %.4f below 0.1%%", symbol, penetration)
                 continue
 

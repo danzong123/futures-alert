@@ -221,17 +221,11 @@ def run_check(config, notifier):
         logger.warning("No quotes data - skipping cycle")
         return 0
 
-    active = quotes["last_price"].notna().sum()
-    logger.info("Main contracts: %d total, %d with realtime quotes",
-                len(quotes), active)
-
     all_symbols = quotes["symbol"].tolist()
+    total_count = len(all_symbols)
+    logger.info("Main contracts: %d total", total_count)
 
-    # Filter to active contracts only (has realtime price, skip suspended)
-    active_mask = quotes["last_price"].notna()
-    quotes = quotes[active_mask].copy()
-    all_symbols = quotes["symbol"].tolist()
-    logger.info("Active (with price): %d / %d total", len(all_symbols), active)
+    # Load K-lines first, then filter by which ones actually have recent data
 
     # --- Step 2: Load K-lines for all contracts (per-contract error isolation) ---
     monitor_cfg = config.get("monitor", {})
@@ -241,6 +235,29 @@ def run_check(config, notifier):
     ok, fail = load_all_klines(all_symbols, period, tail)
     logger.info("K-line load: %d ok, %d failed (cache: %d total)",
                 ok, fail, len(CACHE))
+
+    # Filter to active contracts: K-line data exists AND latest bar is within 4 hours
+    active_symbols = []
+    cutoff = datetime.now().timestamp() - 4 * 3600
+    for sym in list(CACHE.keys()):
+        df = CACHE[sym]
+        if df is not None and not df.empty and "datetime" in df.columns:
+            latest_dt = df["datetime"].iloc[-1]
+            if hasattr(latest_dt, 'timestamp'):
+                if latest_dt.timestamp() > cutoff:
+                    active_symbols.append(sym)
+            else:
+                active_symbols.append(sym)  # can't check, include anyway
+        else:
+            active_symbols.append(sym)  # no datetime col, include
+    # Remove inactive symbols from cache
+    for sym in list(CACHE.keys()):
+        if sym not in active_symbols:
+            del CACHE[sym]
+    # Also filter quotes to match
+    quotes = quotes[quotes["symbol"].isin(active_symbols)]
+    all_symbols = active_symbols
+    logger.info("Active (recent K-line): %d / %d total", len(all_symbols), total_count)
 
     if len(CACHE) == 0:
         logger.warning("No K-line data available - skipping analysis")
